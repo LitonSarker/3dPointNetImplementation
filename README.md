@@ -68,7 +68,7 @@ pip install numpy scipy pandas matplotlib plyfile
 
 ## 🔄 Pipeline Overview
 
-![Pipeline](Process Flow.png)
+![Pipeline](my_pipeline.png)
 
 
 ## 🚀 Usage
