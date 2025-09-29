@@ -68,7 +68,7 @@ pip install numpy scipy pandas matplotlib plyfile
 
 ## 🔄 Pipeline Overview
 
-![Pipeline](my_pipeline.png)
+![Pipeline](assets/my_pipeline.png)
 
 
 ## 🚀 Usage
