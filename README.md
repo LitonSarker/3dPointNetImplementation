@@ -91,7 +91,7 @@ python train_eval_pointnet2_cpu.py   --train_files .\out_ply	rain_med.txt   --va
 ├── make_splits_3dis.py               # Train/val split (80:20)
 ├── train_eval_pointnet2_cpu.py       # Training + evaluation
 ├── infer_pointnet2_cpu.py            # Inference on new data
-├── eval_list_single.py               # Eval on single list
+├── eval_list.py                      # Eval on batch against ground truth on validation list
 ├── export_class_views_cpu.py         # Export class views
 ├── occlusion_eval_cpu.py             # Occlusion evaluation
 ├── .venv/                            # Virtual environment
