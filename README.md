@@ -40,7 +40,7 @@ Target audience: **researchers, industry engineers, and PhD advisors** intereste
 
 ## 🚀 Usage
 
-#All the executable commands are written in the folder named ![Commands_to_execute](Command_to_execute.txt)
+#All the executable commands are written in the folder named ![Commands_to_execute.txt](Command_to_execute.txt)
 
 ---
 
@@ -54,6 +54,9 @@ Target audience: **researchers, industry engineers, and PhD advisors** intereste
 ├── eval_list.py                      # Eval on batch against ground truth on validation list
 ├── export_class_views_cpu.py         # Export class views
 ├── occlusion_eval_cpu.py             # Occlusion evaluation
+├── dataset_ply_cpu.py                # Original pointnet implementation
+├── pointnet2_cpu.py                  # Original pointnet implementation
+├── metrics_pointcloud_cpu.py         # Original pointnet implementation
 ├── .venv/                            # Virtual environment
 ├── class_views/                      # Subset views (hallway, etc.)
 ├── out_ply/                          # Processed PLYs by area
