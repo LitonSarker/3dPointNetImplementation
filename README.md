@@ -34,7 +34,7 @@ Target audience: **researchers, industry engineers, and PhD advisors** intereste
 
 ## ⚙️ Requirements
 
-## 🔄 Pipeline Overview
+## Pipeline Overview
 
 ![Pipeline](assets/Process_Flow.png)
 
@@ -80,6 +80,8 @@ See all runnable commands: [Command_to_execute.txt](Command_to_execute.txt)
 - Validation metrics (evaluated every 2 epochs):  
   - mIoU: 0.072 (ep2) → 0.229 (ep12)  
   - OA: 0.599 (ep12)  
+
+
 
 ---
 
