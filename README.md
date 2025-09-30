@@ -40,7 +40,8 @@ Target audience: **researchers, industry engineers, and PhD advisors** intereste
 
 ## 🚀 Usage
 
-#All the executable commands are written in the folder named ![Commands_to_execute.txt](Command_to_execute.txt)
+See all runnable commands: [Command_to_execute.txt](Command_to_execute.txt)
+
 
 ---
 
