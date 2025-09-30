@@ -30,41 +30,9 @@ Target audience: **researchers, industry engineers, and PhD advisors** intereste
 - Dataset: [Stanford Large-Scale 3D Indoor Spaces (S3DIS)](https://cvg-data.inf.ethz.ch/s3dis/)  
 - Format: RGB-D point clouds → converted to `.ply`.  
 
-### 1. Convert annotations to `.ply`
-```bash
-python s3dis_annots_to_ply_general.py   --root /path/to/Stanford3dDataset_v1.2_Aligned_Version   --dst  /path/to/out_ply
-```
-
-### 2. Create train/val splits (80:20)
-```bash
-python make_splits_3dis.py --src_dir .\out_ply --val_ratio 0.2
-```
-
 ---
 
 ## ⚙️ Requirements
-
-### Python environment
-```bash
-# create venv
-py -3.12 -m venv .venv
-.\.venv\Scriptsctivate
-
-# upgrade pip
-python -m pip install --upgrade pip
-```
-
-### Install dependencies
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-pip install open3d==0.19.0
-pip install "git+https://github.com/isl-org/Open3D-ML@v0.18.0"
-pip install numpy scipy pandas matplotlib plyfile
-```
-
-> This implementation is **CPU-only**.
-
----
 
 ## 🔄 Pipeline Overview
 
@@ -72,7 +40,7 @@ pip install numpy scipy pandas matplotlib plyfile
 
 ## 🚀 Usage
 
-#All the executable commands are written in the folder named Command_to_execute.txt
+#All the executable commands are written in the folder named ![Execution](Command_to_execute.txt)
 
 ---
 
@@ -89,7 +57,6 @@ pip install numpy scipy pandas matplotlib plyfile
 ├── .venv/                            # Virtual environment
 ├── class_views/                      # Subset views (hallway, etc.)
 ├── out_ply/                          # Processed PLYs by area
-├── Pointnet2_PyTorch/                # PointNet++ implementation
 ├── results/                          # Predictions + CSV exports
 └── runs/
     └── seg_cpu/
@@ -124,16 +91,14 @@ pip install numpy scipy pandas matplotlib plyfile
 ## 🔮 Next Steps / TODO
 
 - Multi-modal fusion (point cloud + CCTV/drone imagery).  
-- Larger-scale datasets.  
+- Training on Larger-scale datasets with more epochs and dynamic learning rate.  
 - GPU support for faster training.  
 - Explainability (Grad-CAM, attention maps).  
 
 ---
 
 ## 📚 Citation & Credits
-
-- PointNet++: [Qi et al. (2017)](https://arxiv.org/abs/1706.02413)  
-- Implementation support: **GPT-5.0**
 - Qi, C. R., Yi, L., Su, H., & Guibas, L. J. (2017). (https://arxiv.org/abs/1706.02413)
 - Armeni, I., Sener, O., Zamir, A. R., Jiang, H., Brilakis, I., Fischer, M., & Savarese, S. (2016). (https://arxiv.org/abs/1607.05644)
 - Zhou, Q.-Y., Park, J., & Koltun, V. (2018). {https://arxiv.org/abs/1801.09847}
+- Implementation support: **GPT-5.0**
