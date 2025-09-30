@@ -1,0 +1,232 @@
+@Liton Sarker, 2025
+
+#The below steps are to set the environment, collecting dataset, preprocessing
+#Performing training and validation, evaluation, executing infer operation, class-wise segmentation, performing occlusion test
+
+Step#1:
+====================== Preparing and Activating Python Virtual Environment (VENV) =====================================
+# create venv
+# Python 3.12 used for this implementation. Go to the directory you want to install python venv
+# Open PowerShell (if you are in Windows)
+
+python -3.12 -m venv .venv
+
+# activate venv
+.\.venv\Scripts\activate
+
+Step#2
+======================= The below part is for Non-CUDA varient (CPU) but having comparatively slower processing of PointNet++ ======
+# upgrade pip
+python -m pip install --upgrade pip
+
+# Install necessary libraries
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install open3d==0.19.0
+pip install "git+https://github.com/isl-org/Open3D-ML@v0.18.0"
+
+Step#3
+======================= Dataset Preparation ===========================
+# Collecting all .ply files and put into out_ply folder for further processing
+https://cvg-data.inf.ethz.ch/s3dis/
+
+** Stanford3dDataset_v1.2_Aligned_Version.zip	2023-04-05 18:07	4.1G
+
+# Converting the txt files into ply files
+python s3dis_annots_to_ply_general.py \
+  --root /path/to/Stanford3dDataset_v1.2_Aligned_Version \
+  --dst  /path/to/out_ply
+
+#Spliting the dataset into train and eval by 80:20 ratio
+python .\make_splits_3dis.py --src_dir .\out_ply" --val_ratio 0.2
+
+Step#4
+======================= Train and Validation Test Run ==================================
+python -u train_eval_pointnet2_cpu.py `
+	--train_files .\out_ply\train_full.txt `
+	--val_files   .\out_ply\val_full.txt `
+	--num_classes 13 `
+	--epochs 12 `
+	--batch_size 4 `
+	--num_points 1024 `
+	--num_workers 0 `
+	--log_interval 10 `
+	--eval_every 2 `
+	--seed 42 `
+	--use_rgb
+
+
+Step#5 (Better to get more accurate results)-I didn't run it yet. This can resume training from last performed epoch (i,e: #12)
+
+python -u train_eval_pointnet2_cpu.py `
+  --train_files .\out_ply\train_full.txt `
+  --val_files   .\out_ply\val_full.txt `
+  --num_classes 13 `
+  --epochs 80 `
+  --batch_size 2 `
+  --num_points 2048 `
+  --num_workers 0 `
+  --log_interval 10 `
+  --eval_every 2 `
+  --seed 42 `
+  --use_rgb `
+  --resume_if_exists `						#This line ensures resuming the previous training
+  --checkpoint_every 2
+
+Step#6
+#############################  Evaluate + Visualize by Infer ############################
+
+============== Example: Scene 1 ========================
+python infer_pointnet2_cpu.py `
+	--ply .\out_ply\Area_1\conferenceRoom_1\conferenceRoom_1.ply `
+	--num_classes 13 `
+	--ckpt runs\seg_cpu\checkpoints\best_model.pth `
+	--out_ply .\results\conferenceRoom_1_pred.ply `
+	--save_labels `
+	--use_rgb `
+	--use_normals
+
+============= Example: Scene 2 ========================
+python infer_pointnet2_cpu.py `
+  --ply .\out_ply\Area_5\pantry_1\pantry_1.ply `
+  --num_classes 13 `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --out_ply .\results\pantry_1_pred.ply `
+  --save_labels `
+  --use_rgb `
+  --use_normals
+
+
+============= Example: Scene 3 ========================
+python infer_pointnet2_cpu.py `
+  --ply .\out_ply\Area_4\conferenceRoom_1\conferenceRoom_1.ply `
+  --num_classes 13 `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --out_ply .\results\Area_4_conferenceRoom_1_pred.ply `
+  --save_labels `
+  --use_rgb `
+  --use_normals
+
+Step#7
+=================================== Performing evaluation on the whole dataset to see the model's performance =================
+python eval_list.py `
+  --files .\out_ply\val_full.txt `
+  --num_classes 13 `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --use_rgb `
+  --use_normals `
+  --chunk_size 120000 `								# To avoid memory overflow
+  --out_csv .\results\eval_val_full.csv `
+  --class_names Ceiling,Floor,Wall,Beam,Column,Window,Door,Table,Chair,Sofa,Bookcase,Board,Clutter
+
+Step#8
+=================================== Generating Per Class View =====================================
+#The below table shows the standard S3DIS dataset's class mapping, this would be helpful to create meaningful results
+
+| ID | Class Name |
+| -- | ---------- |
+| 0  | Ceiling    |
+| 1  | Floor      |
+| 2  | Wall       |
+| 3  | Beam       |
+| 4  | Column     |
+| 5  | Window     |
+| 6  | Door       |
+| 7  | Table      |
+| 8  | Chair      |
+| 9  | Sofa       |
+| 10 | Bookcase   |
+| 11 | Board      |
+| 12 | Clutter    |
+
+###### Full Validation Dataset Scope (this takes time on CPU)
+
+python export_class_views_cpu.py `
+  --files .\out_ply\val_full.txt `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --outdir .\results\class_views `
+  --use_rgb `
+  --use_normals `
+  --class_names "Ceiling,Floor,Wall,Beam,Column,Window,Door,Table,Chair,Sofa,Bookcase,Board,Clutter"
+
+
+#The below command is for performing class wise view for specific scene, for test 3 scene has been tested
+
+=================== Area_1, conferenceRoom_1 as an sample ======================
+python export_class_views_cpu.py `
+  --ply out_ply\Area_1\conferenceRoom_1\conferenceRoom_1.ply `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --outdir results\class_views\Area_1_conferenceRoom_1 `
+  --use_rgb `
+  --use_normals --knn_normals 12 `
+  --class_names "Ceiling,Floor,Wall,Beam,Column,Window,Door,Table,Chair,Sofa,Bookcase,Board,Clutter"
+
+=================== Area_5, pantry_1 as an sample ======================
+python export_class_views_cpu.py `
+  --ply out_ply\Area_5\pantry_1\pantry_1.ply `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --outdir results\class_views\pantry_1 `
+  --use_rgb `
+  --use_normals --knn_normals 12 `
+  --class_names "Ceiling,Floor,Wall,Beam,Column,Window,Door,Table,Chair,Sofa,Bookcase,Board,Clutter"
+
+=================== Area_4, conferenceRoom_1 as an sample ======================
+python export_class_views_cpu.py `
+  --ply out_ply\Area_4\conferenceRoom_1\conferenceRoom_1.ply `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --outdir results\class_views\Area_4_conferenceRoom_1 `
+  --use_rgb `
+  --use_normals --knn_normals 12 `
+  --class_names "Ceiling,Floor,Wall,Beam,Column,Window,Door,Table,Chair,Sofa,Bookcase,Board,Clutter"
+
+Step#9
+========================= Applying Occlusion in the model and test the robustneess of the model =========================
+#Scene#1
+python occlusion_eval_cpu.py `
+  --ply .\out_ply\Area_1\conferenceRoom_1\conferenceRoom_1.ply `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --use_rgb `
+  --use_normals `
+  --occlusion 0,40,80 `
+  --chunk_size 120000 `
+  --seeds 1,2 `
+  --out_csv .\results\occlusion_eval_conferenceRoom_1.csv
+
+#Scene#2
+python occlusion_eval_cpu.py `
+  --ply .\out_ply\Area_5\pantry_1\pantry_1.ply `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --use_rgb `
+  --use_normals `
+  --occlusion 0,40,80 `
+  --chunk_size 120000 `
+  --seeds 1,2 `
+  --out_csv .\results\occlusion_eval_pantry_1.csv
+  
+#Scene#3
+python occlusion_eval_cpu.py `
+  --ply .\out_ply\Area_4\conferenceRoom_1\conferenceRoom_1.ply `
+  --ckpt runs\seg_cpu\checkpoints\best_model.pth `
+  --num_classes 13 `
+  --use_rgb `
+  --use_normals `
+  --occlusion 0,40,80 `
+  --chunk_size 120000 `
+  --seeds 1,2 `
+  --out_csv .\results\occlusion_eval_Area_4_conferenceRoom_1.csv
+  
+
+
+
+Tips: If CPU get's exhausted while running, the below comamnds (Windows PowerShell or CMD) may be helpful 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% No crush, small chunk, full scope of dataset %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# inside your conda/venv but not on Python
+$env:CUDA_VISIBLE_DEVICES = ""     # force CPU
+$env:PYTHONUNBUFFERED    = "1"     # flush prints
+$env:OMP_NUM_THREADS     = "6"     # tame oversubscription (adjust 4–8)
+$env:MKL_NUM_THREADS     = "6"
