@@ -1,231 +1,335 @@
 # infer_pointnet2_cpu.py
-# CPU-only PointNet++ (SSG, pure PyTorch) inference script with:
-# - optional k-NN label smoothing (--smooth_knn)
-# - auto-extended color palette for any num_classes
-# - reproducible subsampling (--seed)
-# - normals support (--use_normals) to match 9-ch checkpoints (xyz+RGB+normals as features; xyz separate)
+# Self-contained, CPU-only PointNet++ (SSG) inference (no external model imports). Inline implementation.
+# Robust to checkpoint channels (auto-infers from weights). Exports PLY + CSV (+ optional labels.txt).
 
-import argparse, csv, collections
+import argparse
+from pathlib import Path
 import numpy as np
-import torch  # type: ignore
-import open3d as o3d  # type: ignore
-from pointnet2_cpu import PointNet2_SSG_Seg
+import torch
+import torch.nn as nn
+from typing import List, Optional
 
-# ---------- Palette helpers ----------
-BASE_PALETTE = np.array([
-    [ 31,119,180],[255,127, 14],[ 44,160, 44],[214, 39, 40],
-    [148,103,189],[140, 86, 75],[227,119,194],[127,127,127],
-    [188,189, 34],[ 23,190,207],[174,199,232],[255,187,120],
-    [152,223,138]
-], dtype=np.uint8)
+# ============ Core ops ============
+# Farthest Point Sampling (FPS), Ball Query, Indexing, 3-NN Interpolation
+# Farthest Point Sampling): Selects m points from the input cloud by iteratively picking the farthest points to ensure good spatial coverage
+ 
+def fps(x: torch.Tensor, m: int) -> torch.Tensor:
+    B, N, _ = x.shape
+    device = x.device
+    idx = torch.zeros(B, m, dtype=torch.long, device=device)
+    farthest = torch.randint(0, N, (B,), device=device)         # Initial farthest point indices
+    dist = torch.full((B, N), 1e10, device=device)              # Initialize distances to large values
+    batch_indices = torch.arange(B, device=device)              # Batch indices for advanced indexing
+    for i in range(m):
+        idx[:, i] = farthest
+        centroid = x[batch_indices, farthest, :].unsqueeze(1)   # (B,1,3)
+        d = torch.sum((x - centroid) ** 2, dim=2)               # (B,N) squared distances to the new centroid
+        dist = torch.minimum(dist, d)                           # Update minimum distances
+        farthest = torch.max(dist, dim=1).indices               # Next farthest point
+    return idx
 
-CLASS_NAMES = [
-    "ceiling", "floor", "wall", "beam", "column", "window",
-    "door", "table", "chair", "sofa", "bookcase", "board", "clutter"
-]
+# Ball Query: For each centroid, finds up to K nearest neighbors within a specified radius, returning their indices
+# For each centroid, finds up to K neighboring points within a given radius in the point cloud
+# If fewer than K points are found, the nearest points are duplicated to ensure K neighbors
+def ball_query(x: torch.Tensor, centroids: torch.Tensor, radius: float, K: int) -> torch.Tensor:
+    dists = torch.cdist(centroids, x, p=2)          # (B,M,N) pairwise distances
+    within = dists <= radius                        # (B,M,N) boolean mask of points within radius
+    dists_masked = dists.clone()                    # Mask distances outside radius
+    dists_masked[~within] = 1e10                    # Large value for points outside radius
+    idx = torch.topk(dists_masked, k=K, dim=2, largest=False).indices       # (B,M,K)
+    return idx
 
-def make_palette(n: int) -> np.ndarray:
-    if n <= BASE_PALETTE.shape[0]:
-        return BASE_PALETTE[:n].copy()
-    extra = n - BASE_PALETTE.shape[0]
-    hues = (np.arange(extra) / max(1, extra)).reshape(-1, 1)
-    s = np.full((extra,1), 0.65, dtype=np.float32)
-    v = np.full((extra,1), 0.95, dtype=np.float32)
-    hsv = np.concatenate([hues, s, v], axis=1)
-    rgb = hsv_to_rgb(hsv)
-    extra_rgb = np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
-    return np.vstack([BASE_PALETTE, extra_rgb])
+# Indexing: Gathers points or features based on provided indices
+# Gathers points or features from the input tensor based on the provided indices
+def index_points(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    B, N, C = x.shape           # (B,N,C)
+    batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(-1, idx.size(1), idx.size(2))     # (B,M,K)
+    return x[batch_idx, idx, :]         # (B,M,K,C)
 
-def hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
-    h, s, v = hsv[:,0], hsv[:,1], hsv[:,2]
-    i = np.floor(h * 6).astype(int)
-    f = h * 6 - i
-    p = v * (1 - s)
-    q = v * (1 - f * s)
-    t = v * (1 - (1 - f) * s)
-    i_mod = i % 6
-    r = np.select([i_mod==0, i_mod==1, i_mod==2, i_mod==3, i_mod==4, i_mod==5],
-                  [v, q, p, p, t, v], default=0)
-    g = np.select([i_mod==0, i_mod==1, i_mod==2, i_mod==3, i_mod==4, i_mod==5],
-                  [t, v, v, q, p, p], default=0)
-    b = np.select([i_mod==0, i_mod==1, i_mod==2, i_mod==3, i_mod==4, i_mod==5],
-                  [p, p, t, v, v, q], default=0)
-    return np.stack([r,g,b], axis=1)
+#Interpolates features for source points by weighting the 3 nearest neighbors from destination points based on inverse distance.
+# Uses torch.cdist for distance computation and gathers features accordingly.
+def three_nn_interpolate(xyz_src: torch.Tensor, xyz_dst: torch.Tensor, feat_dst: torch.Tensor) -> torch.Tensor:
+    d = torch.cdist(xyz_src, xyz_dst, p=2) + 1e-8               # (B,Ns,Nd) pairwise distances
+    idx = torch.topk(d, k=3, dim=2, largest=False).indices      # (B,Ns,3)
+    d3 = torch.gather(d, 2, idx)                                # (B,Ns,3)
+    w = (1.0 / d3)
+    w = w / torch.sum(w, dim=2, keepdim=True)
+    w = w.unsqueeze(1)
+    feat_dst_perm = feat_dst.permute(0, 2, 1)
+    gathered = index_points(feat_dst_perm, idx)           # (B,Ns,3,Cd)
+    gathered = gathered.permute(0, 3, 1, 2).contiguous()  # (B,Cd,Ns,3)
+    return torch.sum(gathered * w, dim=3)                 # (B,Cd,Ns)
 
-# ---------- IO ----------
-def ensure_normals(pcd: o3d.geometry.PointCloud, knn: int = 16) -> np.ndarray:
-    if not pcd.has_normals():
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
-        try:
-            pcd.orient_normals_consistent_tangent_plane(knn)
-        except Exception:
-            pass
-    return np.asarray(pcd.normals).astype(np.float32)
+# ============ Blocks ============
+# Set Abstraction (SA) with Single-Scale Grouping (SSG) and Feature Propagation (FP)
+# Each SA layer downsamples points and extracts local features using MLPs and max pooling.
+# Each FP layer upsamples and refines features by interpolating from a coarser level
 
-def read_points_from_ply(path: str, use_rgb: bool = False, use_normals: bool = False):
-    """
-    Returns:
-      xyz:   (N,3) float32  -> coordinates ONLY
-      feats: (N,C) float32  -> EXTRA features ONLY (RGB and/or normals), C in {0,3,6}
-    """
-    pcd = o3d.io.read_point_cloud(path)
-    if pcd.is_empty():
-        raise ValueError(f"Empty/unreadable point cloud: {path}")
+class SA_SSG(nn.Module):
+    def __init__(self, npoint: int, radius: float, nsample: int, in_channels: int, mlp: List[int]):
+        super().__init__()
+        self.npoint = npoint; self.radius = radius; self.nsample = nsample
+        layers = []; last_c = in_channels + 3       # in_channels + 3 (relative xyz)
+        for out_c in mlp:                           # +3 for relative xyz
+            layers += [nn.Conv2d(last_c, out_c, 1), nn.BatchNorm2d(out_c), nn.ReLU(inplace=True)]       # 1x1 conv, BN, ReLU
+            last_c = out_c
+        self.mlp = nn.Sequential(*layers)       # Sequential MLP
 
-    xyz = np.asarray(pcd.points, dtype=np.float32)  # (N,3)
-
-    rgb = None
-    if use_rgb:
-        if pcd.has_colors():
-            rgb = np.asarray(pcd.colors, dtype=np.float32)  # (N,3) in 0..1
-            if rgb.max() > 1.0:  # safety
-                rgb = rgb / 255.0
+    # Forward pass: samples points, groups neighbors, applies MLP, and pools features
+    def forward(self, xyz: torch.Tensor, features: Optional[torch.Tensor]):
+        B, N, _ = xyz.shape
+        idx = fps(xyz, self.npoint)
+        new_xyz = xyz[torch.arange(B).unsqueeze(-1), idx]
+        knn_idx = ball_query(xyz, new_xyz, self.radius, self.nsample)       # (B,npoint,nsample)
+        grouped_xyz = index_points(xyz, knn_idx)                            # (B,npoint,nsample,3)
+        grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)               # Normalize
+        if features is not None:
+            feat = features.permute(0, 2, 1).contiguous()
+            grouped_feat = index_points(feat, knn_idx)
+            new_feat = torch.cat([grouped_xyz_norm, grouped_feat], dim=-1)
         else:
-            rgb = np.zeros_like(xyz, dtype=np.float32)
+            new_feat = grouped_xyz_norm
+        new_feat = new_feat.permute(0, 3, 1, 2).contiguous()                # (B,C,npoint,nsample)
+        new_feat = self.mlp(new_feat)                                       # (B,C',npoint,nsample) 
+        new_feat = torch.max(new_feat, dim=3).values
+        return new_xyz, new_feat
 
-    nrm = ensure_normals(pcd) if use_normals else None  # (N,3) or None
+# Feature Propagation (FP) layer: interpolates and refines features from a coarser level to a finer level
+class FP(nn.Module):
+    def __init__(self, in_channels: int, mlp: List[int]):
+        super().__init__()
+        layers = []; last_c = in_channels
+        for out_c in mlp:
+            layers += [nn.Conv1d(last_c, out_c, 1), nn.BatchNorm1d(out_c), nn.ReLU(inplace=True)]
+            last_c = out_c
+        self.mlp = nn.Sequential(*layers)
 
-    parts = []
-    if rgb is not None: parts.append(rgb)
-    if nrm is not None: parts.append(nrm)
-    feats = np.concatenate(parts, axis=1).astype(np.float32) if parts else None  # (N,C) or None
-    return xyz, feats
+    def forward(self, xyz_src, xyz_dst, feat_src, feat_dst):
+        interpolated = three_nn_interpolate(xyz_src, xyz_dst, feat_dst)
+        fused = torch.cat([interpolated, feat_src], dim=1) if feat_src is not None else interpolated
+        return self.mlp(fused)
 
-def write_colored_ply(points_xyz, labels, out_path, palette):
-    labels = labels.astype(np.int64).reshape(-1)
-    labels_clamped = np.clip(labels, 0, palette.shape[0]-1)
-    colors = palette[labels_clamped] / 255.0
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_xyz.astype(np.float32))
-    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-    ok = o3d.io.write_point_cloud(out_path, pcd, write_ascii=True)
-    if not ok:
-        raise RuntimeError(f"Failed to write: {out_path}")
+# ============ Model ============
+# PointNet2 with Single-Scale Grouping (SSG) for point cloud segmentation
+# The model consists of three Set Abstraction (SA) layers followed by three Feature Propagation (FP) layers and a final classification head
+# Inline implementation for CPU inference, from original PointNet++ architecture
 
-# ---------- kNN smoothing ----------
-def smooth_labels_knn(points_xyz: np.ndarray, labels: np.ndarray, k: int) -> np.ndarray:
-    N = points_xyz.shape[0]
-    if k <= 1 or N == 0:
-        return labels
-    valid = labels >= 0
-    if not np.any(valid):
-        return labels
-    pts_valid = points_xyz[valid]
-    lbl_valid = labels[valid]
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_valid.astype(np.float64))
-    kdt = o3d.geometry.KDTreeFlann(pcd)
+class PointNet2_SSG_Seg(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int):
+        super().__init__()
+        # Lightweight CPU config
+        self.sa1 = SA_SSG(512, 0.10, 16, in_channels, [64, 64, 128])        # +3 for relative xyz
+        self.sa2 = SA_SSG(128, 0.20, 16, 128,         [128, 128, 256])      # +3 for relative xyz
+        self.sa3 = SA_SSG(32,  0.40, 16, 256,         [256, 256, 512])      # +3 for relative xyz
+        self.fp3 = FP(512 + 256, [256, 256])                                # +256 from skip connection
+        self.fp2 = FP(256 + 128, [256, 128])                                # +128 from skip connection     
+        self.fp1 = FP(128 + in_channels, [128, 128, 128])                   # +in_channels from input features  
+        
+        # Final classification head, 1x1 conv, BN, ReLU, Dropout, 1x1 conv, output, logits,
+        self.head = nn.Sequential(
+            nn.Conv1d(128, 128, 1), nn.BatchNorm1d(128), nn.ReLU(inplace=True),         # 1x1 conv, BN, ReLU
+            nn.Dropout(0.1),                                                            # Dropout
+            nn.Conv1d(128, num_classes, 1)                                              # 1x1 conv to num_classes     
+        )
 
-    smoothed = labels.copy()
-    idx_map = np.where(valid)[0]
-    for j in range(pts_valid.shape[0]):
-        ok, nn_idx, _ = kdt.search_knn_vector_3d(pts_valid[j], k)
-        if ok <= 0:
-            continue
-        votes = lbl_valid[np.asarray(nn_idx, dtype=int)]
-        from collections import Counter
-        c = Counter(votes.tolist()).most_common(1)[0][0]
-        smoothed[idx_map[j]] = c
-    return smoothed
+    # Forward pass through SA and FP layers, followed by the classification head
+    # xyz: (B,N,3), feats: (B,C,N) or None, Returns: logits (B,num_classes,N)
 
-# ---------- Main ----------
+    def forward(self, xyz: torch.Tensor, feats: Optional[torch.Tensor] = None):
+        l1_xyz, l1_feat = self.sa1(xyz, feats)
+        l2_xyz, l2_feat = self.sa2(l1_xyz, l1_feat)
+        l3_xyz, l3_feat = self.sa3(l2_xyz, l2_feat)
+        l2_up = self.fp3(l2_xyz, l3_xyz, l2_feat, l3_feat)
+        l1_up = self.fp2(l1_xyz, l2_xyz, l1_feat, l2_up)
+        up0 = self.fp1(xyz, l1_xyz, feats, l1_up)
+        return self.head(up0)
+
+# ============ IO helpers ============
+def _try_import_open3d():
+    try:
+        import open3d as o3d
+        return o3d
+    except Exception:
+        return None
+# Read PLY, return (N,3) xyz, (N,3) rgb or None, (N,3) normals or None
+# Supports Open3D or plyfile, prefers Open3D if available, raises if neither is installed
+def _read_ply_xyz_rgb_n(o3d, ply_path):
+    ply_path = str(ply_path)
+    if o3d is not None:
+        pcd = o3d.io.read_point_cloud(ply_path)
+        if pcd.is_empty(): raise ValueError(f"Open3D read empty point cloud from {ply_path}")
+        xyz = np.asarray(pcd.points, dtype=np.float32)
+        rgb = np.asarray(pcd.colors, dtype=np.float32) if pcd.has_colors() else None
+        normals = np.asarray(pcd.normals, dtype=np.float32) if pcd.has_normals() else None
+        return xyz, rgb, normals
+    try:
+        from plyfile import PlyData
+        pd = PlyData.read(ply_path); el = pd["vertex"]
+        xyz = np.stack([el["x"], el["y"], el["z"]], axis=1).astype(np.float32)
+        rgb = None; normals = None
+        if all(k in el.data.dtype.names for k in ("red","green","blue")):
+            rgb = np.stack([el["red"], el["green"], el["blue"]], axis=1).astype(np.float32)/255.0
+        if all(k in el.data.dtype.names for k in ("nx","ny","nz")):
+            normals = np.stack([el["nx"], el["ny"], el["nz"]], axis=1).astype(np.float32)
+        return xyz, rgb, normals
+    except Exception as e:
+        raise RuntimeError("Install open3d or plyfile to read PLY.") from e
+
+# Write PLY with colors (N,3) xyz, (N,3) colors in [0,1], using Open3D or plyfile, prefers Open3D if available
+# Raises if neither is installed
+
+def _write_ply_with_colors(o3d, out_path, xyz, colors):
+    if o3d is None:
+        try:
+            from plyfile import PlyData, PlyElement
+            pts = np.concatenate([xyz, (colors * 255).astype(np.uint8)], axis=1)
+            dtype = [("x","f4"),("y","f4"),("z","f4"),("red","u1"),("green","u1"),("blue","u1")]
+            arr = np.array([tuple(row) for row in pts], dtype=dtype)
+            PlyData([PlyElement.describe(arr, "vertex")], text=True).write(out_path); return
+        except Exception as e:
+            raise RuntimeError("Install open3d or plyfile to write PLY.") from e
+    import open3d as o3d_local
+    pcd = o3d_local.geometry.PointCloud()
+    pcd.points = o3d_local.utility.Vector3dVector(xyz)
+    pcd.colors = o3d_local.utility.Vector3dVector(colors.clip(0,1))
+    o3d_local.io.write_point_cloud(out_path, pcd, write_ascii=True)
+
+# ============ Utils ============
+# Tries to detect the input channel size (in_channels) from a checkpoint dictionary.
+def _infer_in_channels_from_ckpt(ckpt):
+    for key in ("hparams","config","model_args"):                       
+        if isinstance(ckpt.get(key), dict):
+            for k2 in ("in_channels","input_channels"):
+                v = ckpt[key].get(k2)
+                if isinstance(v, (int, float)): return int(v)
+    for k in ("in_channels","input_channels"):
+        v = ckpt.get(k)
+        if isinstance(v, (int, float)): return int(v)
+    return None
+
+# Extracts the actual model weights (state_dict) from a checkpoint container.
+def _unwrap_state_dict(ckpt):
+    for k in ("model_state","state_dict","model"):
+        if isinstance(ckpt.get(k), dict): return ckpt[k]
+    if isinstance(ckpt, dict): return ckpt
+    raise KeyError("No state_dict found in checkpoint.")
+
+# Concatenates selected features (XYZ, RGB, normals) into a single input array.
+def _build_features(xyz, rgb, normals, use_rgb, use_normals):
+    feats = [xyz]; order = ["XYZ"]
+    if use_rgb and (rgb is not None): feats.append(rgb); order.append("RGB")
+    if use_normals and (normals is not None): feats.append(normals); order.append("normals")
+    X = np.concatenate(feats, axis=1).astype(np.float32)
+    return X, order
+
+# Adjusts feature dimensions to match the expected channel size by trimming or zero-padding
+def _truncate_or_pad(X, want_c, order):
+    have = X.shape[1]
+    if (want_c is None) or (want_c == have): return X
+    if have > want_c:
+        print(f"[INFO] Truncating {have}->{want_c} (order={','.join(order)})")
+        return X[:, :want_c]
+    print(f"[INFO] Padding {have}->{want_c} (order={','.join(order)})")
+    pad = np.zeros((X.shape[0], want_c - have), dtype=X.dtype)
+    return np.concatenate([X, pad], axis=1)
+
+# Creates a fixed random color palette for visualizing class labels.
+def _label_palette(n):
+    rng = np.random.default_rng(13)
+    cols = rng.random((n, 3)); cols[0] = np.array([0.2,0.2,0.2]); return cols
+
+# ============ Main ============
 def main():
-    ap = argparse.ArgumentParser(description="CPU-only PointNet++ (SSG, pure PyTorch) inference")
-    ap.add_argument("--ply", required=True, help="Input .ply path")
-    ap.add_argument("--out_ply", required=True, help="Output colored .ply path")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ply", required=True)
     ap.add_argument("--num_classes", type=int, required=True)
-    ap.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path")
-    ap.add_argument("--use_rgb", action="store_true", help="Use RGB channels (xyz+rgb)")
-    ap.add_argument("--use_normals", action="store_true", help="Use normals (xyz+rgb+normals)")
-    ap.add_argument("--max_points", type=int, default=80000, help="Subsample to this many points for speed")
-    ap.add_argument("--save_labels", action="store_true", help="Also save raw predicted labels as .npy and CSV")
-    ap.add_argument("--smooth_knn", type=int, default=0, help="If >0, apply k-NN majority-vote smoothing")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed for subsampling")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--out_ply", required=True)
+    ap.add_argument("--save_labels", action="store_true")
+    ap.add_argument("--use_rgb", action="store_true")
+    ap.add_argument("--use_normals", action="store_true")
+    ap.add_argument("--class_names", type=str,
+                    default="ceiling,floor,wall,beam,column,window,door,table,chair,sofa,bookcase,board,clutter")
     args = ap.parse_args()
 
-    PALETTE = make_palette(args.num_classes)
-    rng = np.random.default_rng(args.seed)
+    # Read input
+    o3d = _try_import_open3d()
+    xyz_np, rgb_np, normals_np = _read_ply_xyz_rgb_n(o3d, args.ply)
 
-    # Read: xyz separate, feats = RGB and/or normals ONLY
-    xyz, feats = read_points_from_ply(args.ply, use_rgb=args.use_rgb, use_normals=args.use_normals)  # (N,3), (N,C) or None
-    N = xyz.shape[0]
-    C = 0 if feats is None else feats.shape[1]  # 0/3/6 (NOT including xyz)
-    in_ch = C
+    # Features from file
+    X, order = _build_features(xyz_np, rgb_np, normals_np, args.use_rgb, args.use_normals)
 
-    # Subsample
-    if N > args.max_points:
-        idx = rng.choice(N, args.max_points, replace=False)
-        xyz_sub = xyz[idx]
-        feats_sub = None if feats is None else feats[idx]
-        inv_map = idx
+    # Load ckpt + unwrap + infer channels from WEIGHTS
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    sd = _unwrap_state_dict(ckpt)
+
+    # Determines how many input channels the checkpointed model expects and reshapes the feature matrix accordingly so it can be fed into the network without mismatch errors.
+    sa1_key = None
+    for cand in ("sa1.mlp.0.weight","module.sa1.mlp.0.weight"):         
+        if any(k.endswith(cand) for k in sd.keys()):
+            sa1_key = next(k for k in sd.keys() if k.endswith(cand)); break
+    if sa1_key is None:
+        feat_meta = _infer_in_channels_from_ckpt(ckpt)
+        sa1_in_total = (feat_meta + 3) if (feat_meta is not None) else X.shape[1]
     else:
-        xyz_sub, feats_sub = xyz, feats
-        inv_map = None
+        sa1_in_total = sd[sa1_key].shape[1]
 
-    # Tensors
-    xyz_t = torch.from_numpy(xyz_sub).float().unsqueeze(0)  # (1, n, 3)
-    if feats_sub is None:
-        feats_t = None
-    else:
-        feats_t = torch.from_numpy(feats_sub).float().unsqueeze(0).permute(0, 2, 1)  # (1, C, n)
+    feat_ch = max(0, sa1_in_total - 3)   # features expected by ckpt
+    X = _truncate_or_pad(X, sa1_in_total, order)
 
-    # Model: in_channels must equal EXTRA features only
-    model = PointNet2_SSG_Seg(in_channels=in_ch, num_classes=args.num_classes)
-    model.eval()
+    # Split tensors
+    xyz = torch.from_numpy(X[:, :3]).float().unsqueeze(0)     # (1,N,3)
+    feats = None
+    if feat_ch > 0:                              # Take extra channels (e.g., RGB/normals), transpose to (C, N), add batch dim → (1, C, N)
+        feats_np = X[:, 3:3+feat_ch].T[None, ...].astype(np.float32)  # (1,C,N)
+        feats = torch.from_numpy(feats_np).float()
 
-    # Load checkpoint
-    if args.ckpt:
-        try:
-            state = torch.load(args.ckpt, map_location="cpu")
-            cand = None
-            if isinstance(state, dict):
-                for key in ("state_dict", "model_state_dict", "model"):
-                    if key in state and isinstance(state[key], dict):
-                        cand = state[key]; break
-            new_state = cand if cand is not None else state
-            cleaned = {k.replace("model.", "").replace("module.", ""): v for k, v in new_state.items()}
-            missing, unexpected = model.load_state_dict(cleaned, strict=False)
-            print(f"[CKPT] loaded with missing={len(missing)} unexpected={len(unexpected)}")
-            if missing or unexpected:
-                print("[CKPT] Note: Ensure in_channels matches RGB/normals only (0/3/6). XYZ is separate.")
-        except Exception as e:
-            print(f"[CKPT] failed to load ({e}); proceeding with random weights.")
+    # num_classes from head if present, # --- Determine number of classes from checkpoint head (if available) ---
 
-    # Inference
+    head_key = None
+    for cand in ("head.4.weight","module.head.4.weight"):
+        if any(k.endswith(cand) for k in sd.keys()):
+            head_key = next(k for k in sd.keys() if k.endswith(cand)); break
+    num_classes = sd[head_key].shape[0] if head_key is not None else int(args.num_classes)
+
+    # Build Model &  load weights, set to eval on CPU ---
+
+    model = PointNet2_SSG_Seg(in_channels=feat_ch, num_classes=num_classes)
+    model.load_state_dict(sd, strict=False)
+    model.eval().to("cpu")
+
+    # Inference,  Run inference: forward pass only, no gradient ---
+
     with torch.no_grad():
-        logits = model(xyz_t, feats_t)  # (1, num_classes, n)
-        pred_sub = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy()  # (n,)
+        logits = model(xyz, feats)                      # (1,num_classes,N)
+        preds = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
 
-    # Map back
-    if inv_map is not None:
-        labels_out = np.full((N,), -1, dtype=np.int64)
-        labels_out[inv_map] = pred_sub
-        pts_out = xyz
-    else:
-        pts_out = xyz_sub
-        labels_out = pred_sub
+    # --- Colorize predictions and save as PLY ---
+    palette = _label_palette(num_classes)
+    colors = palette[preds]
+    out_dir = Path(args.out_ply).parent; out_dir.mkdir(parents=True, exist_ok=True)
+    _write_ply_with_colors(o3d, args.out_ply, xyz_np, colors)
 
-    # Optional smoothing
-    if args.smooth_knn and args.smooth_knn > 0:
-        print(f"[INFO] k-NN smoothing with k={args.smooth_knn}")
-        labels_out = smooth_labels_knn(pts_out, labels_out, args.smooth_knn)
-
-    # Write outputs
-    write_colored_ply(pts_out, labels_out, args.out_ply, PALETTE)
-    print(f"[OK] wrote colored predictions to: {args.out_ply}")
+    # --- Save labels as .txt (optional) ---
 
     if args.save_labels:
-        npy_path = args.out_ply.replace(".ply", "_labels.npy")
-        np.save(npy_path, labels_out)
-        print(f"[OK] saved raw labels to: {npy_path}")
+        labels_path = str(Path(args.out_ply).with_suffix("")) + "_labels.txt"
+        np.savetxt(labels_path, preds, fmt="%d")
+        print(f"[OK] Saved labels: {labels_path}")
 
-        csv_path = args.out_ply.replace(".ply", "_labels_xyz.csv")
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f); w.writerow(["x","y","z","label","class_name"])
-            valid = labels_out >= 0
-            for p, lbl in zip(pts_out[valid], labels_out[valid]):
-                w.writerow([float(p[0]), float(p[1]), float(p[2]), int(lbl), CLASS_NAMES[int(lbl)] if 0 <= lbl < len(CLASS_NAMES) else "unknown"])
-        print(f"[OK] saved CSV (x,y,z,label) to: {csv_path}")
+    # Save CSV (x,y,z,label,class_name)
+    names = [s.strip() for s in args.class_names.split(",")]
+    if len(names) < num_classes:
+        names += [f"class_{i}" for i in range(len(names), num_classes)]
+    csv_path = str(Path(args.out_ply).with_suffix("")) + "_labels.csv"
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("x,y,z,label,class_name\n")
+        for (x, y, z), lab in zip(xyz_np, preds):
+            cname = names[int(lab)] if 0 <= int(lab) < len(names) else f"class_{int(lab)}"
+            f.write(f"{x},{y},{z},{int(lab)},{cname}\n")
+    print(f"[OK] Saved CSV: {csv_path}")
+
+    print(f"[OK] Wrote colorized predictions: {args.out_ply}")
 
 if __name__ == "__main__":
     main()
