@@ -72,15 +72,7 @@ pip install numpy scipy pandas matplotlib plyfile
 
 ## 🚀 Usage
 
-### Training
-```bash
-python train_eval_pointnet2_cpu.py   --train_files .\out_ply	rain_med.txt   --val_files   .\out_plyal_med.txt   --num_classes 13   --epochs 40   --batch_size 1   --num_points 512   --outdir runs\seg_med
-```
-
-### Outputs
-- Checkpoints: `runs/seg_cpu/checkpoints/{last_model.pth, best_model.pth}`  
-- Metrics history: `runs/seg_cpu/history.json`  
-- Training logs: `runs/seg_cpu/train_log.json`  
+#All the executable commands are written in the folder named Command_to_execute.txt
 
 ---
 
@@ -142,3 +134,6 @@ python train_eval_pointnet2_cpu.py   --train_files .\out_ply	rain_med.txt   --va
 
 - PointNet++: [Qi et al. (2017)](https://arxiv.org/abs/1706.02413)  
 - Implementation support: **GPT-5.0**
+- Qi, C. R., Yi, L., Su, H., & Guibas, L. J. (2017). (https://arxiv.org/abs/1706.02413)
+- Armeni, I., Sener, O., Zamir, A. R., Jiang, H., Brilakis, I., Fischer, M., & Savarese, S. (2016). (https://arxiv.org/abs/1607.05644)
+- Zhou, Q.-Y., Park, J., & Koltun, V. (2018). {https://arxiv.org/abs/1801.09847}
