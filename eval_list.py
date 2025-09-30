@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-# eval_list_single.py  —  One-file, chunk-safe evaluator for PointNet++ (CPU)
+# eval_list.py  —  One-file, chunk-safe evaluator for PointNet++ (CPU)
 # Usage:
-#   python eval_list_single.py --files .\out_ply\val_full.txt --num_classes 13 \
-#     --ckpt runs\seg_cpu\checkpoints\best_model.pth --use_rgb --use_normals \
-#     --chunk_size 120000 --out_csv .\results\eval_val_full.csv
+# Mentioned in the Command file
 
 import argparse, os, csv
 import numpy as np
 import torch # type: ignore
-import torch.nn as nn
+import torch.nn as nn # type: ignore
 
 # Optional (used by the PLY fallback path and normals)
 try:
-    import open3d as o3d
+    import open3d as o3d # type: ignore
 except Exception:
     o3d = None
 
@@ -20,18 +18,24 @@ def estimate_normals_o3d(xyz: np.ndarray, k: int = 16) -> np.ndarray:
     """Estimate normals; returns (N,3) float32. Falls back to zeros if Open3D unavailable."""
     N = xyz.shape[0]
     if N == 0:
+        # Empty input → just return an empty (0,3) array
         return np.zeros((0,3), dtype=np.float32)
     if o3d is None:
         # Fallback: zeros (keeps channel count correct for checkpoints that expect normals)
         return np.zeros((N,3), dtype=np.float32)
-    pcd = o3d.geometry.PointCloud()
+    
+    # Create an Open3D point cloud object from the xyz coordinates
+    pcd = o3d.geometry.PointCloud()         # 
     pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
+    
+    # Try to make the normals point in consistent directions (orientation smoothing)
     try:
         pcd.orient_normals_consistent_tangent_plane(k)
     except Exception:
+        # If orientation step fails, just skip it
         pass
-    return np.asarray(pcd.normals, dtype=np.float32)
+    return np.asarray(pcd.normals, dtype=np.float32)        # Return the normals as a NumPy float32 array of shape (N,3)
 
 # ===========================
 # 1) Minimal ASCII PLY parser
@@ -85,13 +89,16 @@ def _parse_ascii_ply(path: str):
 
     arr = np.asarray(data, dtype=np.float32)
     name_to_col = {name: idx for idx, name in enumerate(properties[:arr.shape[1]])}
-    # xyz
-    x_idx = name_to_col.get('x', 0)
+    
+    # Extract xyz coordinates 
+    x_idx = name_to_col.get('x', 0)         
     y_idx = name_to_col.get('y', 1)
     z_idx = name_to_col.get('z', 2)
     xyz = arr[:, [x_idx, y_idx, z_idx]].astype(np.float32)
 
-    # rgb
+    # Extract rgb colors
+    # Figure out column names for RGB (different datasets use 'red/green/blue' or 'r/g/b')
+
     r_key = 'red' if 'red' in name_to_col else ('r' if 'r' in name_to_col else None)
     g_key = 'green' if 'green' in name_to_col else ('g' if 'g' in name_to_col else None)
     b_key = 'blue' if 'blue' in name_to_col else ('b' if 'b' in name_to_col else None)
@@ -109,7 +116,7 @@ def _parse_ascii_ply(path: str):
             except Exception:
                 pass
 
-    # label
+    # Extract labels (segmentation classes)
     lbl = None
     for cand in ('label', 'seg_label', 'class', 'y'):
         if cand in name_to_col:
@@ -134,14 +141,14 @@ def scores_from_cm(cm: np.ndarray):
     eps = 1e-9
     total = cm.sum()
     correct = np.trace(cm)
-    oa = correct / (total + eps)
-    tp = np.diag(cm).astype(np.float64)
-    fn = cm.sum(axis=1) - tp
-    fp = cm.sum(axis=0) - tp
+    oa = correct / (total + eps)        # Overall Accuracy (total correct ÷ total points)
+    tp = np.diag(cm).astype(np.float64) # True Positives: diagonal of confusion matrix
+    fn = cm.sum(axis=1) - tp            # False Negatives: row sum minus TP
+    fp = cm.sum(axis=0) - tp            # False Positives: column sum minus TP
 
-    denom = tp + fp + fn + eps
-    iou = tp / denom
-    acc_per = tp / (tp + fn + eps)
+    denom = tp + fp + fn + eps          # Denominator for IoU (TP + FP + FN)
+    iou = tp / denom                    # Intersection over Union per class
+    acc_per = tp / (tp + fn + eps)      # Per-class accuracy (recall): TP / (TP + FN)
 
     return {
         'OA': float(oa),
@@ -152,8 +159,9 @@ def scores_from_cm(cm: np.ndarray):
     }
 
 # =========================================
-# 3) PointNet++ (SSG) — CPU-friendly module
+# 3) PointNet++ (SSG) — CPU-friendly module, inline implementation to avoid imports
 # =========================================
+# This is similar with the Infer script
 
 def fps(x: torch.Tensor, m: int) -> torch.Tensor:
     B, N, _ = x.shape
@@ -289,9 +297,15 @@ class PointNet2_SSG_Seg(nn.Module):
 
         return self.head(up0)   # (B,num_classes,N)
 
+############# End of Original PointNet++ (SSG) #############
+
 # ==================================
 # 4) Chunked inference & CLI runner
 # ==================================
+# Weight update frozen to avoid 
+# Run memory-safe inference over a large point cloud by slicing it into chunks, optionally build features (RGB/normals), and accumulate a confusion matrix against ground truth
+# Output: A (num_classes, num_classes) confusion matrix for the full scene.
+
 @torch.no_grad()
 def infer_one_chunked(model, rec, num_classes, use_rgb, use_normals, device, chunk_size=60000):
     xyz_np = rec["xyz"]                                # (N,3)
@@ -338,6 +352,8 @@ def infer_one_chunked(model, rec, num_classes, use_rgb, use_normals, device, chu
     return cm
 
 # --- auto-detect expected input channels from checkpoint ---
+# Infer how many feature channels (excluding XYZ) the model expects from a checkpoint’s state dict.
+# Auto-align constructed features (RGB/normals) to the checkpoint’s expected input width without hardcoding, preventing size mismatch errors at inference. This avoids mismatch of channels
 def _expected_in_ch_from_sd(state):
     # sa1.mlp.0.weight has shape [64, (in_ch+3), 1, 1]
     w = state.get("sa1.mlp.0.weight", None)
@@ -381,12 +397,13 @@ def main():
     in_ch = C
 
     # Build & load model
+    # Creates a PointNet++ model with the CLI-specified in_channels and num_classes, loads the checkpoint from disk, and unwraps the state_dict if the checkpoint is a container.
     model = PointNet2_SSG_Seg(in_channels=in_ch, num_classes=args.num_classes).to(device)
     sd = torch.load(args.ckpt, map_location=device)
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
     
-
+    # Inspects the checkpoint weights to infer the expected feature channel count; if it differs from the CLI setting, it rebuilds the model to match the checkpoint so loading won’t fail.
     exp_in_ch = _expected_in_ch_from_sd(sd)
     if exp_in_ch is not None and exp_in_ch != in_ch:
         print(f"[INFO] Rebuilding model: checkpoint expects in_channels={exp_in_ch}, "
@@ -394,11 +411,11 @@ def main():
         in_ch = exp_in_ch
         model = PointNet2_SSG_Seg(in_channels=in_ch, num_classes=args.num_classes).to(device)
 
-
+    # Loads the checkpoint weights into the model (strictly matching keys/shapes) and puts the model in evaluation mode (BatchNorm/Dropout behave deterministically).
     model.load_state_dict(sd, strict=True)
     model.eval()
 
-    # Class names (optional)
+    # Class names, which is human readable
     if args.class_names:
         class_names = [s.strip() for s in args.class_names.split(",")]
         if len(class_names) != args.num_classes:
@@ -406,7 +423,7 @@ def main():
     else:
         class_names = [f"class_{i}" for i in range(args.num_classes)]
 
-    # Aggregate CM across scenes
+    # Aggregate CM across scenes, Iterates over each .ply file, parses it, runs chunked inference (memory-safe) to compute a scene-level confusion matrix, and accumulates into a global confusion matrix across all scenes.
     cm_total = np.zeros((args.num_classes, args.num_classes), dtype=np.int64)
     for p in ply_files:
         print(f"[Eval] {os.path.basename(p)}")
@@ -417,7 +434,7 @@ def main():
 
     scores = scores_from_cm(cm_total)
 
-    # Pretty print
+    # Pretty print, for user understanding and further use
     print("\n=== Final Evaluation (chunked) ===")
     for k, v in scores.items():
         if isinstance(v, (list, np.ndarray)):
