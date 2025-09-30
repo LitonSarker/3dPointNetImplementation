@@ -1,23 +1,22 @@
 """
-make_splits.py
-Recursively scans src_dir/Area_*/**/*.ply and writes train.txt / eval.txt.
+make_splits_3dis.py
+Recursively scans src_dir/Area_*/**/*.ply and writes train_full.txt / val_full.txt.
 
 Usage examples:
-  # Area-based split (recommended for S3DIS)
-  python make_splits.py --src_dir "D:\\3d-point-cloud\\out_ply\\S3DIS\\out_ply" --eval_area Area_5
+Mentioned in the Command_to_Execute file
 
-  # Random 80/20
-  python make_splits.py --src_dir "D:\\3d-point-cloud\\out_ply\\S3DIS\\out_ply" --val_ratio 0.2
 """
 import os
 import argparse
 from pathlib import Path
 import random
 
+# Find all .ply files under Area_1..Area_6 subfolders
 def find_plys(src_dir: Path):
     # matches Area_1..Area_6 subtrees
     return [p.resolve() for p in src_dir.glob("Area_*/*/*.ply")]
 
+# Main function to parse args and create splits based on passed arguments
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src_dir", required=True,
@@ -57,9 +56,9 @@ def main():
         eval_list = list(map(str, ply_files[:n_val]))
         train_list = list(map(str, ply_files[n_val:]))
 
-    # Write lists
-    train_txt = out_root / "train.txt"
-    eval_txt  = out_root / "val.txt"
+    # Write lists based on ratio mentioned in the parser
+    train_txt = out_root / "train_full.txt"
+    eval_txt  = out_root / "val_full.txt"
     train_txt.write_text("\n".join(train_list), encoding="utf-8")
     eval_txt.write_text("\n".join(eval_list),  encoding="utf-8")
 
@@ -73,5 +72,6 @@ def main():
     print(f"[OK] Wrote {len(train_list)} train → {train_txt}  ({area_counts(train_list)})")
     print(f"[OK] Wrote {len(eval_list)}  eval → {eval_txt}   ({area_counts(eval_list)})")
 
+#Main function call
 if __name__ == "__main__":
     main()
