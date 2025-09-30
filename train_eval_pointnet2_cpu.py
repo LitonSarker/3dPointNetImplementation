@@ -1,6 +1,6 @@
-# train_eval_pointnet2_cpu.py
-# CPU-only training/evaluation for PointNet++ (SSG) semantic segmentation
-# - Keeps PointNet++ implementation: from pointnet2_cpu import PointNet2_SSG_Seg
+# - train_eval_pointnet2_cpu.py
+# - CPU-only training/evaluation for PointNet++ (SSG) semantic segmentation
+# - Keeps PointNet++ implementation: from pointnet2_cpu import PointNet2_SSG_Seg inline rather calling from outside package
 # - Adds robust logging, sanity checks, batch-level try/except, JSON logs
 # - Ensures all data is considered (drop_last=False)
 # - Provides fast-debug flags to finish quickly on CPU
@@ -11,21 +11,25 @@ import torch  # type: ignore
 import torch.nn as nn  # type: ignore
 from torch.utils.data import DataLoader  # type: ignore
 
+#For training on CPU only, the dataset and model are imported from local files, however for the other files, the imports are from the cpu package inline
+
 from dataset_ply_cpu import PLYSegDataset
 from pointnet2_cpu import PointNet2_SSG_Seg
 from metrics_pointcloud_cpu import confusion_matrix, scores_from_cm
 
+#Class name listing
 CLASS_NAMES = [
     "ceiling","floor","wall","beam","column","window",
     "door","table","chair","sofa","bookcase","board","clutter"
 ]
 
+# Reproducibility, seed everything, initialize torch threads
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-
+# Logging setup
 def configure_logging():
     import logging
     logging.basicConfig(
@@ -35,6 +39,8 @@ def configure_logging():
     )
     return logging.getLogger("train")
 
+# Evaluation loop (no grad, model.eval())
+# We choose frozen mode in evaluation because it gives an honest, efficient, and stable measurement of model performance, while preventing accidental training on validation data.
 
 @torch.no_grad()
 def evaluate(model, loader, device, num_classes, log_interval=0):
@@ -71,9 +77,9 @@ def evaluate(model, loader, device, num_classes, log_interval=0):
     scores = scores_from_cm(cm)
     return avg_loss, scores
 
-
+# Main training function
 def main():
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")  # For real-time logging, print logs immediately instead of buffering them
 
     ap = argparse.ArgumentParser(description="CPU-Only PointNet++ (SSG) train/eval")
     # Required IO
@@ -119,7 +125,7 @@ def main():
 
     device = torch.device("cpu")
 
-    # Datasets
+    # Datasets to ensure they can be loaded, transformed, and sampled, and that paths are correct
     train_ds = PLYSegDataset(args.train_files, num_points=args.num_points, use_rgb=args.use_rgb, augment=True)
     val_ds   = PLYSegDataset(args.val_files,   num_points=args.num_points, use_rgb=args.use_rgb, augment=False)
 
@@ -133,6 +139,8 @@ def main():
         drop_last=False,               # ensure every sample is used
         persistent_workers=False,
     )
+
+    # Validation loader, no shuffling, no drop, no augment, no persistent workers, no pin_memory, num_workers=0
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
@@ -160,16 +168,17 @@ def main():
     model = PointNet2_SSG_Seg(in_channels=in_ch, num_classes=args.num_classes).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    # after optimizer
+    
+    # After optimizer, define loss function with label smoothing, which can help regularization, especially on small datasets
     ce = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-    best_miou = -1.0
-    history = []
+    best_miou = -1.0        # best val mIoU so far, for checkpointing, -1 = uninitialized, higher is better
+    history = []            # training history for all epochs
 
     try:
         for epoch in range(1, args.epochs + 1):
-            t0 = time.time()
-            model.train()
+            t0 = time.time()            # epoch start time
+            model.train()               # train mode
 
             # Train accumulators
             cm_tr = np.zeros((args.num_classes, args.num_classes), dtype=np.int64)
@@ -212,8 +221,8 @@ def main():
                     print(json.dumps({"phase": "train", "epoch": epoch, "step": bidx, "error": str(e)}), flush=True)
                     continue
 
-            tr_loss = total_loss_tr / max(1, seen_tr)
-            tr_scores = scores_from_cm(cm_tr)
+            tr_loss = total_loss_tr / max(1, seen_tr)       # average loss
+            tr_scores = scores_from_cm(cm_tr)               # accuracy scores
 
             # Evaluate periodically (to save CPU time)
             if (epoch % args.eval_every) == 0:
@@ -223,7 +232,7 @@ def main():
             else:
                 va_loss, va_scores = float("nan"), {"OA": float("nan"), "mAcc": float("nan"), "mIoU": float("nan")}
 
-            # Log epoch summary (JSON is nice for later parsing)
+            # Log epoch summary (JSON is nice for later parsing, if needed)
             dt = time.time() - t0
             log_epoch = {
                 "epoch": epoch,
@@ -254,7 +263,7 @@ def main():
         with open(os.path.join(args.outdir, "history.json"), "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:               #For accidentally stopping the training, we save the model state
         # Graceful stop with checkpoint
         torch.save(model.state_dict(), os.path.join(ckpt_dir, "interrupt_model.pth"))
         print(json.dumps({"event": "interrupt", "msg": "Saved interrupt_model.pth"}), flush=True)
