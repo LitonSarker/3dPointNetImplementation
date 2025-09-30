@@ -108,3 +108,17 @@ See all runnable commands: [Command_to_execute.txt](Command_to_execute.txt)
 - Armeni, I., Sener, O., Zamir, A. R., Jiang, H., Brilakis, I., Fischer, M., & Savarese, S. (2016). (https://arxiv.org/abs/1607.05644)
 - Zhou, Q.-Y., Park, J., & Koltun, V. (2018). {https://arxiv.org/abs/1801.09847}
 - Implementation support: **GPT-5.0**
+
+---
+
+## 📊 Impact & Stats
+
+- 🚀 **54 unique cloners** and **84 total clones** in the first 3 days  
+- 🌍 Growing interest from researchers in 3D vision + construction monitoring  
+- 🧑‍💻 Repository actively maintained and updated  
+
+![GitHub stars](https://img.shields.io/github/stars/LitonSarker/3dPointNetImplementation?style=social)
+![GitHub forks](https://img.shields.io/github/forks/LitonSarker/3dPointNetImplementation?style=social)
+![GitHub watchers](https://img.shields.io/github/watchers/LitonSarker/3dPointNetImplementation?style=social)
+![GitHub repo size](https://img.shields.io/github/repo-size/LitonSarker/3dPointNetImplementation)
+![GitHub last commit](https://img.shields.io/github/last-commit/LitonSarker/3dPointNetImplementation)
